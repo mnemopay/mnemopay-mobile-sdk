@@ -3,13 +3,14 @@
 export interface Memory {
   id: string;
   content: string;
-  embedding: Float32Array;
+  embedding?: Float32Array; // Made optional for FTS-only recall
   metadata: MemoryMetadata;
   createdAt: number;
   updatedAt: number;
   accessCount: number;
   decayScore: number;
   integrity: string; // HMAC-SHA256 hex of content+metadata+id
+  permanent?: boolean; // If true, exempt from time decay
 }
 
 export interface MemoryMetadata {
@@ -20,7 +21,10 @@ export interface MemoryMetadata {
   importance: number; // 0-1
   spatial?: SpatialAnchor;
   ttl?: number; // ms
+  permanent?: boolean;
 }
+
+export type BlendPreset = 'agent' | 'human' | 'balanced';
 
 export interface MemoryQuery {
   text?: string;
@@ -32,7 +36,11 @@ export interface MemoryQuery {
   spatial?: { lat: number; lng: number; radiusM: number };
   limit?: number;
   threshold?: number; // cosine similarity threshold 0-1
+  blendRatio?: number | BlendPreset; // 0-1 (weight for vector similarity) or preset
+  noveltyMode?: boolean; // If true, use strict matching for duplicate detection
 }
+
+export type DecayCurveMode = 'linear' | 'exponential' | 'logarithmic' | 'none';
 
 export interface MemoryRecallResult {
   memory: Memory;
@@ -75,6 +83,11 @@ export interface EscrowCondition {
   type: EscrowConditionType;
   params: Record<string, unknown>;
   met: boolean;
+}
+
+export interface EscrowConditionParams {
+  h3Tile?: string;
+  [key: string]: unknown;
 }
 
 export interface EscrowContract {
@@ -187,6 +200,11 @@ export interface MnemoPayConfig {
   signingKey?: Uint8Array;     // 32 bytes Ed25519 seed
   embeddingModelPath?: string; // reserved / future local ONNX path
   embeddingDimensions?: number; // default 384; required 384 when embeddings === 'semantic'
+  /** 
+   * Targeted dimensionality for PCA reduction. If set and lower than 
+   * embeddingDimensions, PCA will be applied. 
+   */
+  reducedDimensions?: number; 
   /**
    * Memory vector backend. Default `hash`.
    * `semantic` requires optional peer dependency `@xenova/transformers`.
@@ -200,6 +218,10 @@ export interface MnemoPayConfig {
    * but more DB work. Default 3 (k = limit * 3).
    */
   vectorKMultiplier?: number;
+  /** Candidate pool limit for hybrid reranking. Default 50. */
+  candidateLimit?: number;
+  /** Time decay curve mode. Default 'logarithmic'. */
+  decayCurve?: DecayCurveMode;
   syncEndpoint?: string;       // zero-knowledge cloud sync URL
   dailyLimitCents?: number;    // default 100_000 ($1000)
   memoryCapacity?: number;     // default 10_000 memories
