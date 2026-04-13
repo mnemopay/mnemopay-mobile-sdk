@@ -31,6 +31,8 @@ const SCHEMA = `
     embedding FLOAT[384]
   );
 
+  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id, content, tokenize='porter');
+
   CREATE TABLE IF NOT EXISTS sync_log (
     id         TEXT    PRIMARY KEY,
     table_name TEXT    NOT NULL,
@@ -78,6 +80,16 @@ export class MemoryStore {
     const t = Date.now() - createdAt;
     const cosine = 1.0; // placeholder; real value supplied by caller
     return cosine * Math.pow(2, -t / this.halfLifeMs) * (1 + 0.05 * Math.log2(accessCount + 1)) * importance;
+  }
+
+  // Sanitizes query text for FTS5 to handle special characters and boolean operators
+  private sanitizeFtsQuery(text: string): string {
+    return text
+      .replace(/[^\p{L}\p{N}\s]/gu, '') // Strip non-alphanumeric (Unicode-aware)
+      .split(/\s+/) // Split by whitespace
+      .filter(token => token.length > 0) // Remove empty tokens
+      .map(token => token + '*') // Add wildcard for prefix matching
+      .join(' OR '); // Combine with OR for broad matching
   }
 
   // ── retain ──────────────────────────────────────────────────────────────────
@@ -141,6 +153,7 @@ export class MemoryStore {
       this.db.prepare(`INSERT INTO memory_vectors (id, agent_id, embedding) VALUES (?, ?, ?)`)
         .run(id, this.agentId, new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength));
 
+      this.db.prepare(`INSERT INTO memories_fts (id, content) VALUES (?, ?)`).run(id, content);
       // Track for sync
       this.db.prepare(`
         INSERT OR REPLACE INTO sync_log (id, table_name, record_id, synced, updated_at)
@@ -163,26 +176,64 @@ export class MemoryStore {
     this.rateLimiter.check(this.agentId, 'general');
 
     const queryVec = query.embedding ?? (query.text ? await this.embedText(query.text) : null);
-    if (!queryVec) return [];
+    if (!queryVec && !query.text) return []; // Need either vector or text for search
 
     const limit = query.limit ?? 10;
     const k = Math.max(limit, limit * this.vectorKMultiplier);
 
-    const rows = this.db.prepare(`
-      SELECT m.*, mv.distance
-      FROM memory_vectors mv
-      JOIN memories m ON m.id = mv.id
-      WHERE mv.embedding MATCH ?
-        AND k = ?
-        AND mv.agent_id = ?
-        AND (m.expires_at IS NULL OR m.expires_at > ?)
-      ORDER BY mv.distance
-    `).all(
-      new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength),
-      k, // over-fetch, filter post-decrypt
-      this.agentId,
-      Date.now(),
-    ) as any[];
+    let fts5Ids: string[] | null = null;
+    if (query.text) {
+      const sanitizedQuery = this.sanitizeFtsQuery(query.text);
+      if (sanitizedQuery.length === 0) return []; // Empty query after sanitization
+
+      // Perform FTS5 search to get relevant memory IDs
+      const fts5Matches = this.db.prepare(
+        `SELECT id FROM memories_fts WHERE content MATCH ?`
+      ).all(sanitizedQuery) as { id: string }[];
+      fts5Ids = fts5Matches.map(m => m.id);
+
+      if (fts5Ids.length === 0 && !queryVec) return []; // No FTS5 matches and no vector query
+    }
+
+    let rows: any[] = [];
+    if (queryVec) {
+      // Existing vector search, potentially filtered by FTS5
+      let vectorQuery = `
+        SELECT m.*, mv.distance
+        FROM memory_vectors mv
+        JOIN memories m ON m.id = mv.id
+        WHERE mv.embedding MATCH ?
+          AND k = ?
+          AND mv.agent_id = ?
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+      `;
+      const vectorParams: (string | number | Uint8Array)[] = [
+        new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength),
+        k,
+        this.agentId,
+        Date.now(),
+      ];
+
+      if (fts5Ids && fts5Ids.length > 0) {
+        vectorQuery += ` AND m.id IN (${fts5Ids.map(() => '?').join(',')})`;
+        vectorParams.push(...fts5Ids);
+      }
+      vectorQuery += ` ORDER BY mv.distance`;
+
+      rows = this.db.prepare(vectorQuery).all(...vectorParams) as any[];
+    } else if (fts5Ids && fts5Ids.length > 0) {
+      // If only FTS5 query, fetch memories directly and assign a default distance
+      const placeholders = fts5Ids.map(() => '?').join(',');
+      rows = this.db.prepare(`
+        SELECT m.*, 1.0 AS distance -- Default L2_squared distance for FTS-only (cosine 0.5)
+        FROM memories m
+        WHERE m.id IN (${placeholders})
+          AND m.agent_id = ?
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+      `).all(...fts5Ids, this.agentId, Date.now()) as any[];
+    } else {
+      return []; // No queryVec, no text, no results
+    }
 
     const results: MemoryRecallResult[] = [];
 
@@ -263,6 +314,7 @@ export class MemoryStore {
 
       this.db.prepare(`DELETE FROM memories WHERE id = ? AND agent_id = ?`).run(memoryId, this.agentId);
       this.db.prepare(`DELETE FROM memory_vectors WHERE id = ? AND agent_id = ?`).run(memoryId, this.agentId);
+      this.db.prepare(`DELETE FROM memories_fts WHERE id = ?`).run(memoryId);
     })();
   }
 
