@@ -252,5 +252,5 @@ The SDK is designed for cross-platform compatibility with specific bridges for d
     Mobile environments might require specific build steps or permissions for SQLite and native cryptography modules. Please refer to the respective platform documentation for details.
 
 ---
-**License**: MIT
+**License**: Apache-2.0
 **Author**: Jerry Omiagbo
