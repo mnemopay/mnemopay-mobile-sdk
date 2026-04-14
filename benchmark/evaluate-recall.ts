@@ -115,7 +115,7 @@ async function main() {
       const sessionId = inst.haystack_session_ids[i] ?? `session-${i}`;
       const date = inst.haystack_dates[i] ?? 'unknown';
       const content = formatSession(inst.haystack_sessions[i], sessionId, date);
-      for (const chunk of chunkContent(content, 8000)) {
+      for (const chunk of chunkContent(content, 2000)) {
         await sdk.memory.retain(chunk, {
           source: 'observation',
           sessionId,
