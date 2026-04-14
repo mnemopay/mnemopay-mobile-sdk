@@ -259,6 +259,9 @@ export class MemoryStore {
     }
 
     // 2. Collect Vector candidates
+    // Use limit * vectorKMultiplier so paraphrased queries get enough candidates to rerank.
+    // Take max with candidateLimit so small-limit queries don't regress.
+    const vectorK = Math.max(candidateLimit, limit * this.vectorKMultiplier);
     const vecResults = new Map<string, number>();
     if (queryVec) {
       const rows = this.db.prepare(`
@@ -270,7 +273,7 @@ export class MemoryStore {
         ORDER BY mv.distance
       `).all(
         new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength),
-        candidateLimit,
+        vectorK,
         this.agentId,
       ) as { id: string; distance: number }[];
 
@@ -456,5 +459,47 @@ export class MemoryStore {
 
   count(): number {
     return (this.db.prepare(`SELECT COUNT(*) as c FROM memories WHERE agent_id = ?`).get(this.agentId) as any).c;
+  }
+
+  // ── reinforce — RL feedback loop ─────────────────────────────────────────────
+  /**
+   * Reinforce a memory's importance using an EWMA update.
+   *
+   * @param memoryId - ID of the memory to reinforce
+   * @param reward   - Signal in [-1, 1]: +1 = very useful, 0 = neutral, -1 = useless/harmful
+   * @param alpha    - Learning rate (default 0.1). Higher = faster adaptation.
+   *
+   * EWMA formula: new_importance = α * ((reward + 1) / 2) + (1 − α) * old_importance
+   * Maps reward [-1,1] into [0,1] before blending with current importance.
+   */
+  reinforce(memoryId: string, reward: number, alpha = 0.1): void {
+    this.guard.enforce('memory:write');
+    const clampedReward = Math.max(-1, Math.min(1, reward));
+    const normalizedReward = (clampedReward + 1) / 2;
+    const clampedAlpha = Math.max(0.01, Math.min(0.5, alpha));
+
+    const row = this.db.prepare(
+      `SELECT importance FROM memories WHERE id = ? AND agent_id = ?`
+    ).get(memoryId, this.agentId) as { importance: number } | undefined;
+
+    if (!row) return;
+
+    const newImportance = Math.max(0, Math.min(1,
+      clampedAlpha * normalizedReward + (1 - clampedAlpha) * row.importance
+    ));
+
+    this.db.prepare(
+      `UPDATE memories SET importance = ?, updated_at = ? WHERE id = ? AND agent_id = ?`
+    ).run(newImportance, Date.now(), memoryId, this.agentId);
+  }
+
+  /**
+   * Batch-reinforce multiple memories from the same recall session.
+   * Applies the same reward signal to all provided IDs.
+   */
+  reinforceBatch(memoryIds: string[], reward: number, alpha = 0.1): void {
+    for (const id of memoryIds) {
+      this.reinforce(id, reward, alpha);
+    }
   }
 }

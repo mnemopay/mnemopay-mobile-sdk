@@ -251,6 +251,25 @@ The SDK is designed for cross-platform compatibility with specific bridges for d
 
     Mobile environments might require specific build steps or permissions for SQLite and native cryptography modules. Please refer to the respective platform documentation for details.
 
+### RL Feedback — Reinforcement Learning for Memory
+
+After a recall + agent action, you can signal whether the recalled memories were useful. This updates each memory's `importance` score via EWMA so future recalls surface better results.
+
+```typescript
+// Recall memories for a query
+const results = await sdk.memory.recall({ text: 'user dietary preferences', limit: 5 });
+
+// ... agent acts on the recalled memories ...
+
+// Signal reward: +1 = very useful, 0 = neutral, -1 = useless
+sdk.memory.reinforceBatch(results.map(r => r.memory.id), 1.0);
+
+// Or reinforce a single memory
+sdk.memory.reinforce(results[0].memory.id, 0.8, /* alpha= */ 0.1);
+```
+
+EWMA update: `new_importance = α × ((reward+1)/2) + (1−α) × old_importance`
+
 ---
 **License**: Apache-2.0
 **Author**: Jerry Omiagbo
