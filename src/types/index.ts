@@ -226,4 +226,12 @@ export interface MnemoPayConfig {
   dailyLimitCents?: number;    // default 100_000 ($1000)
   memoryCapacity?: number;     // default 10_000 memories
   memoryHalfLifeDays?: number; // default 7 days
+  /**
+   * Dev-only escape hatch. When true, allows the SDK to fall back to a
+   * deterministic agentId-derived key if a persistent random DEK cannot be
+   * written. Ignored in production (NODE_ENV=production). DO NOT SET in a
+   * shipping build — exists only so unit tests and local dev can run on
+   * read-only filesystems without throwing.
+   */
+  allowInsecureDefault?: boolean;
 }
