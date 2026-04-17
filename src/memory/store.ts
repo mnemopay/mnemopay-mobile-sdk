@@ -3,11 +3,13 @@ import * as sqliteVec from 'sqlite-vec';
 import { sha256 } from '@noble/hashes/sha256'; // Keep sha256 for integrity check
 import {
   Memory, MemoryMetadata, MemoryQuery, MemoryRecallResult, MnemoPayConfig,
+  DecayCurveMode, BlendPreset,
 } from '../types/index';
 import { PlatformCrypto, generateId } from '../security/crypto';
 import { PermissionGuard, SecurityError } from '../security/permissions';
 import { RateLimiter } from '../security/rate-limiter';
 import { FraudDetector } from '../security/fraud-detector';
+import { classifyQuery, BLEND_PRESETS } from './queryClassifier';
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS memories (
@@ -22,7 +24,8 @@ const SCHEMA = `
     updated_at       INTEGER NOT NULL,
     expires_at       INTEGER,
     agent_id         TEXT    NOT NULL,
-    session_id       TEXT    NOT NULL
+    session_id       TEXT    NOT NULL,
+    permanent        INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
@@ -31,12 +34,19 @@ const SCHEMA = `
     embedding FLOAT[384]
   );
 
+  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id, content, tokenize='porter');
+
   CREATE TABLE IF NOT EXISTS sync_log (
     id         TEXT    PRIMARY KEY,
     table_name TEXT    NOT NULL,
     record_id  TEXT    NOT NULL,
     synced     INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS store_config (
+    key   TEXT PRIMARY KEY,
+    value BLOB
   );
 `;
 
@@ -47,6 +57,8 @@ export class MemoryStore {
   private readonly embeddingDim: number;
   private readonly embedText: (text: string) => Promise<Float32Array>;
   private readonly vectorKMultiplier: number;
+  private readonly candidateLimit: number;
+  private readonly decayCurve: DecayCurveMode;
 
   constructor(
     private readonly db: Database.Database,
@@ -63,6 +75,8 @@ export class MemoryStore {
     this.embeddingDim = config.embeddingDimensions ?? 384;
     this.embedText = embedText;
     this.vectorKMultiplier = Math.max(1, Math.floor(config.vectorKMultiplier ?? 3));
+    this.candidateLimit = config.candidateLimit ?? 50;
+    this.decayCurve = config.decayCurve ?? 'logarithmic';
   }
 
   static loadExtensions(db: Database.Database): void {
@@ -73,11 +87,42 @@ export class MemoryStore {
     db.exec(SCHEMA);
   }
 
-  // decay-adjusted score: s * 2^(-t/h) * (1 + 0.05 * log2(a+1)) * i
-  private decayedScore(createdAt: number, accessCount: number, importance: number): number {
-    const t = Date.now() - createdAt;
-    const cosine = 1.0; // placeholder; real value supplied by caller
-    return cosine * Math.pow(2, -t / this.halfLifeMs) * (1 + 0.05 * Math.log2(accessCount + 1)) * importance;
+  private calculateDecay(createdAt: number, mode: DecayCurveMode, boostDecay = false): number {
+    if (mode === 'none') return 1.0;
+
+    const ageMs = Date.now() - createdAt;
+    const ageDays = ageMs / 86_400_000;
+    const maxAgeDays = (this.halfLifeMs * 10) / 86_400_000; // heuristic limit
+    
+    let factor = 1.0;
+    switch (mode) {
+      case 'linear':
+        factor = Math.max(0, 1 - (ageDays / maxAgeDays));
+        break;
+      case 'exponential':
+        const lambda = boostDecay ? 0.1 : 0.05;
+        factor = Math.exp(-lambda * ageDays);
+        break;
+      case 'logarithmic':
+        factor = Math.max(0, 1 - (Math.log(1 + ageDays) / Math.log(1 + maxAgeDays)));
+        break;
+    }
+    return factor;
+  }
+
+  // Sanitizes query text for FTS5 to handle special characters and boolean operators
+  private sanitizeFtsQuery(text: string): string {
+    return text
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ') // Replace non-alphanumeric with space
+      .split(/\s+/) // Split by whitespace
+      .filter(token => token.length > 0) // Remove empty tokens
+      .map(token => {
+        // If it's a number, it's likely a specific ID/index, prioritize it
+        if (/^\d+$/.test(token)) return `"${token}"`;
+        // For words, use prefix wildcard for flexibility but wrap in quotes for exactness
+        return token.length > 3 ? `"${token}" OR "${token}*"` : `"${token}"`;
+      })
+      .join(' OR '); // Combine with OR for broad matching
   }
 
   // ── retain ──────────────────────────────────────────────────────────────────
@@ -87,9 +132,8 @@ export class MemoryStore {
   ): Promise<Memory> {
     this.guard.enforce('memory:write');
 
-    const { allowed, signal } = this.rateLimiter.check(this.agentId, 'memory_write');
+    const { allowed } = this.rateLimiter.check(this.agentId, 'memory_write');
     if (!allowed) {
-      this.fraud.getLog(); // signal already logged
       throw new SecurityError('RATE_LIMITED', 'Memory write rate limit exceeded');
     }
 
@@ -125,22 +169,25 @@ export class MemoryStore {
     const encContent = await this.crypto.encrypt(Buffer.from(content, 'utf8'));
     const encMeta = await this.crypto.encrypt(Buffer.from(JSON.stringify(fullMeta), 'utf8'));
 
+    const isPermanent = metadata.permanent ? 1 : 0;
+
     this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO memories
           (id, content_enc, metadata_enc, integrity_mac, importance, access_count,
-           decay_score, created_at, updated_at, expires_at, agent_id, session_id)
-        VALUES (?, ?, ?, ?, ?, 0, 1.0, ?, ?, ?, ?, ?)
+           decay_score, created_at, updated_at, expires_at, agent_id, session_id, permanent)
+        VALUES (?, ?, ?, ?, ?, 0, 1.0, ?, ?, ?, ?, ?, ?)
       `).run(
         id, encContent, encMeta, integrityMac,
         clampedImportance, now, now,
         fullMeta.ttl ? now + fullMeta.ttl : null,
-        this.agentId, fullMeta.sessionId,
+        this.agentId, fullMeta.sessionId, isPermanent
       );
 
       this.db.prepare(`INSERT INTO memory_vectors (id, agent_id, embedding) VALUES (?, ?, ?)`)
         .run(id, this.agentId, new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength));
 
+      this.db.prepare(`INSERT INTO memories_fts (id, content) VALUES (?, ?)`).run(id, content);
       // Track for sync
       this.db.prepare(`
         INSERT OR REPLACE INTO sync_log (id, table_name, record_id, synced, updated_at)
@@ -154,6 +201,7 @@ export class MemoryStore {
       id, content, embedding, metadata: fullMeta,
       createdAt: now, updatedAt: now, accessCount: 0,
       decayScore: 1.0, integrity: Buffer.from(integrityMac).toString('hex'),
+      permanent: !!metadata.permanent,
     };
   }
 
@@ -163,48 +211,102 @@ export class MemoryStore {
     this.rateLimiter.check(this.agentId, 'general');
 
     const queryVec = query.embedding ?? (query.text ? await this.embedText(query.text) : null);
-    if (!queryVec) return [];
+    if (!queryVec && !query.text) return [];
 
     const limit = query.limit ?? 10;
-    const k = Math.max(limit, limit * this.vectorKMultiplier);
+    const candidateLimit = this.candidateLimit;
 
+    // 0. Query Classification
+    let blendWeight = 0.8;
+    let boostDecay = false;
+
+    if (query.noveltyMode) {
+      blendWeight = 1.0; // Strict semantic-only matching for novelty checks
+    } else if (query.text) {
+      const classification = classifyQuery(query.text);
+      blendWeight = classification.recommendedBlend;
+      boostDecay = classification.boostDecay ?? false;
+    }
+
+    // Override with explicit blendRatio if provided
+    if (query.blendRatio !== undefined && !query.noveltyMode) {
+      if (typeof query.blendRatio === 'string') {
+        blendWeight = BLEND_PRESETS[query.blendRatio];
+      } else {
+        blendWeight = query.blendRatio;
+      }
+    }
+
+    const ftsWeight = 1.0 - blendWeight;
+
+    // 1. Collect FTS candidates
+    const ftsScores = new Map<string, number>();
+    if (query.text && !query.noveltyMode) {
+      const sanitizedQuery = this.sanitizeFtsQuery(query.text);
+      if (sanitizedQuery.length > 0) {
+        const ftsMatches = this.db.prepare(`
+          SELECT id, rank 
+          FROM memories_fts 
+          WHERE content MATCH ? 
+          ORDER BY rank 
+          LIMIT ?
+        `).all(sanitizedQuery, candidateLimit) as { id: string; rank: number }[];
+        
+        ftsMatches.forEach((m, i) => {
+          ftsScores.set(m.id, 1.0 / (i + 1));
+        });
+      }
+    }
+
+    // 2. Collect Vector candidates
+    // Use limit * vectorKMultiplier so paraphrased queries get enough candidates to rerank.
+    // Take max with candidateLimit so small-limit queries don't regress.
+    const vectorK = Math.max(candidateLimit, limit * this.vectorKMultiplier);
+    const vecResults = new Map<string, number>();
+    if (queryVec) {
+      const rows = this.db.prepare(`
+        SELECT mv.id, mv.distance
+        FROM memory_vectors mv
+        WHERE mv.embedding MATCH ?
+          AND k = ?
+          AND mv.agent_id = ?
+        ORDER BY mv.distance
+      `).all(
+        new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength),
+        vectorK,
+        this.agentId,
+      ) as { id: string; distance: number }[];
+
+      rows.forEach(r => vecResults.set(r.id, r.distance));
+    }
+
+    // 3. Union of candidates
+    const candidateIds = Array.from(new Set([...ftsScores.keys(), ...vecResults.keys()]));
+    if (candidateIds.length === 0) return [];
+
+    // 4. Fetch full rows and rerank
+    const placeholders = candidateIds.map(() => '?').join(',');
     const rows = this.db.prepare(`
-      SELECT m.*, mv.distance
-      FROM memory_vectors mv
-      JOIN memories m ON m.id = mv.id
-      WHERE mv.embedding MATCH ?
-        AND k = ?
-        AND mv.agent_id = ?
-        AND (m.expires_at IS NULL OR m.expires_at > ?)
-      ORDER BY mv.distance
-    `).all(
-      new Uint8Array(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength),
-      k, // over-fetch, filter post-decrypt
-      this.agentId,
-      Date.now(),
-    ) as any[];
+      SELECT * FROM memories 
+      WHERE id IN (${placeholders})
+        AND agent_id = ?
+        AND (expires_at IS NULL OR expires_at > ?)
+    `).all(...candidateIds, this.agentId, Date.now()) as any[];
 
     const results: MemoryRecallResult[] = [];
 
     for (const row of rows) {
       try {
-        // Decrypt
         const content = Buffer.from(await this.crypto.decrypt(Buffer.from(row.content_enc))).toString('utf8');
         const metadata: MemoryMetadata = JSON.parse(
           Buffer.from(await this.crypto.decrypt(Buffer.from(row.metadata_enc))).toString('utf8'),
         );
 
-        // Verify integrity — skip tampered records
         const integrityInput = Buffer.from(JSON.stringify({
-          id: row.id,
-          content,
+          id: row.id, content,
           metadata: {
-            source: metadata.source,
-            sessionId: metadata.sessionId,
-            agentId: metadata.agentId,
-            tags: metadata.tags,
-            importance: metadata.importance,
-            ttl: metadata.ttl,
+            source: metadata.source, sessionId: metadata.sessionId, agentId: metadata.agentId,
+            tags: metadata.tags, importance: metadata.importance, ttl: metadata.ttl,
           }
         }), 'utf8');
         const valid = await this.crypto.verifyHmac(integrityInput, Buffer.from(row.integrity_mac));
@@ -216,44 +318,55 @@ export class MemoryStore {
         if (query.tags?.length && !query.tags.some(t => metadata.tags.includes(t))) continue;
         if (query.minImportance != null && metadata.importance < query.minImportance) continue;
 
-        const l2Squared: number = row.distance;
-        const cosine = 1 - (l2Squared / 2);
-        // console.log(`ID: ${row.id}, dist: ${l2Squared}, sim: ${cosine}, threshold: ${query.threshold}`);
+        const distance = vecResults.get(row.id) ?? 1.0;
+        const ftsScore = ftsScores.get(row.id) ?? 0.0;
         
-        if (query.threshold != null && cosine < query.threshold) continue;
+        const cosine = 1 - (distance / 2);
+        if (query.threshold != null && cosine < query.threshold && ftsScore === 0) continue;
 
-        const score = cosine
-          * Math.pow(2, -(Date.now() - row.created_at) / this.halfLifeMs)
+        // Combined Score: Higher weight to FTS (0.4) for precise matching in hybrid scenarios
+        // if no explicit blendRatio is provided.
+        const effectiveBlend = (query.blendRatio === undefined && ftsScore > 0) ? 0.6 : blendWeight;
+        const effectiveFtsWeight = 1.0 - effectiveBlend;
+
+        const hybridScore = (cosine * effectiveBlend) + (ftsScore * effectiveFtsWeight);
+        
+        const decayFactor = (row.permanent === 1) ? 1.0 : this.calculateDecay(row.created_at, this.decayCurve, boostDecay);
+
+        const finalScore = hybridScore
+          * decayFactor
           * (1 + 0.05 * Math.log2(row.access_count + 1))
           * metadata.importance;
 
-        // Increment access count
-        this.db.prepare(`UPDATE memories SET access_count = access_count + 1, updated_at = ? WHERE id = ?`)
-          .run(Date.now(), row.id);
-
         results.push({
           memory: {
-            id: row.id, content, embedding: queryVec, metadata,
+            id: row.id, content, embedding: queryVec ?? new Float32Array(), metadata,
             createdAt: row.created_at, updatedAt: row.updated_at,
-            accessCount: row.access_count + 1, decayScore: score,
+            accessCount: row.access_count, decayScore: finalScore,
             integrity: Buffer.from(row.integrity_mac).toString('hex'),
+            permanent: row.permanent === 1,
           },
-          score,
-          distance: l2Squared,
+          score: finalScore,
+          distance,
         });
       } catch {
-        continue; // Decrypt failure or parse error — skip silently
+        continue;
       }
     }
 
-    return results.sort((a, b) => b.score - a.score).slice(0, limit);
+    const finalTopK = results.sort((a, b) => b.score - a.score).slice(0, limit);
+    for (const res of finalTopK) {
+      this.db.prepare(`UPDATE memories SET access_count = access_count + 1, updated_at = ? WHERE id = ?`)
+        .run(Date.now(), res.memory.id);
+    }
+
+    return finalTopK;
   }
 
   // ── forget ───────────────────────────────────────────────────────────────────
   async forget(memoryId: string): Promise<void> {
     this.guard.enforce('memory:delete');
     this.db.transaction(() => {
-      // Zero-fill before delete to prevent forensic recovery
       this.db.prepare(`
         UPDATE memories
         SET content_enc = zeroblob(length(content_enc)),
@@ -263,6 +376,7 @@ export class MemoryStore {
 
       this.db.prepare(`DELETE FROM memories WHERE id = ? AND agent_id = ?`).run(memoryId, this.agentId);
       this.db.prepare(`DELETE FROM memory_vectors WHERE id = ? AND agent_id = ?`).run(memoryId, this.agentId);
+      this.db.prepare(`DELETE FROM memories_fts WHERE id = ?`).run(memoryId);
     })();
   }
 
@@ -297,14 +411,13 @@ export class MemoryStore {
         if (s.endsWith('?')) return false;
         return true;
       })
-      .slice(0, 5); // max 5 facts per call — rate-limit protection
+      .slice(0, 5);
 
     const stored: Memory[] = [];
 
     for (const sentence of sentences) {
       try {
-        // Novelty check at 0.92 threshold
-        const existing = await this.recall({ text: sentence, limit: 1, threshold: 0.92 });
+        const existing = await this.recall({ text: sentence, limit: 1, threshold: 0.92, noveltyMode: true });
         if (existing.length > 0) continue;
 
         const mem = await this.retain(sentence, {
@@ -315,7 +428,7 @@ export class MemoryStore {
         });
         stored.push(mem);
       } catch {
-        break; // Rate limit or fraud block — stop processing
+        break;
       }
     }
 
@@ -346,5 +459,47 @@ export class MemoryStore {
 
   count(): number {
     return (this.db.prepare(`SELECT COUNT(*) as c FROM memories WHERE agent_id = ?`).get(this.agentId) as any).c;
+  }
+
+  // ── reinforce — RL feedback loop ─────────────────────────────────────────────
+  /**
+   * Reinforce a memory's importance using an EWMA update.
+   *
+   * @param memoryId - ID of the memory to reinforce
+   * @param reward   - Signal in [-1, 1]: +1 = very useful, 0 = neutral, -1 = useless/harmful
+   * @param alpha    - Learning rate (default 0.1). Higher = faster adaptation.
+   *
+   * EWMA formula: new_importance = α * ((reward + 1) / 2) + (1 − α) * old_importance
+   * Maps reward [-1,1] into [0,1] before blending with current importance.
+   */
+  reinforce(memoryId: string, reward: number, alpha = 0.1): void {
+    this.guard.enforce('memory:write');
+    const clampedReward = Math.max(-1, Math.min(1, reward));
+    const normalizedReward = (clampedReward + 1) / 2;
+    const clampedAlpha = Math.max(0.01, Math.min(0.5, alpha));
+
+    const row = this.db.prepare(
+      `SELECT importance FROM memories WHERE id = ? AND agent_id = ?`
+    ).get(memoryId, this.agentId) as { importance: number } | undefined;
+
+    if (!row) return;
+
+    const newImportance = Math.max(0, Math.min(1,
+      clampedAlpha * normalizedReward + (1 - clampedAlpha) * row.importance
+    ));
+
+    this.db.prepare(
+      `UPDATE memories SET importance = ?, updated_at = ? WHERE id = ? AND agent_id = ?`
+    ).run(newImportance, Date.now(), memoryId, this.agentId);
+  }
+
+  /**
+   * Batch-reinforce multiple memories from the same recall session.
+   * Applies the same reward signal to all provided IDs.
+   */
+  reinforceBatch(memoryIds: string[], reward: number, alpha = 0.1): void {
+    for (const id of memoryIds) {
+      this.reinforce(id, reward, alpha);
+    }
   }
 }

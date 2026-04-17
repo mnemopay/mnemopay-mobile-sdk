@@ -152,7 +152,17 @@ describe('MnemoPay SDK Full Suite', () => {
 
       const device2Dir = path.join(TEST_DB_DIR, 'device2');
       if (!fs.existsSync(device2Dir)) fs.mkdirSync(device2Dir, { recursive: true });
-      const sdk2 = MnemoPay.create({ agentId, persistDir: device2Dir });
+      // Sync between two devices requires a shared set of keys — in production
+      // these are provisioned out-of-band (e.g. from the user's seed phrase).
+      // For the test we pull them off the source SDK's crypto layer.
+      const srcCrypto: any = (sdk as any).crypto;
+      const sdk2 = MnemoPay.create({
+        agentId,
+        persistDir: device2Dir,
+        encryptionKey: srcCrypto.encKey,
+        hmacKey: srcCrypto.macKey,
+        signingKey: srcCrypto.signingKey,
+      });
 
       const result = await sdk2.sync.applyPullPacket(packet);
       expect(result.merged).toBeGreaterThan(0);

@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { FraudSignal } from '../types/index';
 import { generateId } from './crypto';
 
@@ -19,9 +20,57 @@ interface Window {
   lastRefill: number;
 }
 
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS rate_limit_window (
+    agent_id        TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    timestamps_json TEXT NOT NULL,
+    burst_tokens    REAL NOT NULL,
+    last_refill     INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, category)
+  );
+`;
+
 export class RateLimiter {
-  // agentId -> category -> Window
   private state = new Map<string, Map<Category, Window>>();
+
+  constructor(private readonly db?: Database.Database) {
+    if (db) this.hydrate(db);
+  }
+
+  static initSchema(db: Database.Database): void {
+    db.exec(SCHEMA);
+  }
+
+  // On boot, restore per-agent windows so a restart doesn't reset a throttled
+  // attacker's counter back to zero. Stale windows (outside the widest window)
+  // are naturally pruned on the next check() call by the slide step.
+  private hydrate(db: Database.Database): void {
+    const rows = db.prepare(`SELECT agent_id, category, timestamps_json, burst_tokens, last_refill FROM rate_limit_window`).all() as any[];
+    for (const row of rows) {
+      if (!this.state.has(row.agent_id)) this.state.set(row.agent_id, new Map());
+      try {
+        const timestamps: number[] = JSON.parse(row.timestamps_json);
+        this.state.get(row.agent_id)!.set(row.category as Category, {
+          timestamps,
+          burstTokens: row.burst_tokens,
+          lastRefill: row.last_refill,
+        });
+      } catch { /* corrupt row — skip; slide will rebuild fresh */ }
+    }
+  }
+
+  private persist(agentId: string, cat: Category, w: Window): void {
+    if (!this.db) return;
+    this.db.prepare(`
+      INSERT INTO rate_limit_window (agent_id, category, timestamps_json, burst_tokens, last_refill)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, category) DO UPDATE SET
+        timestamps_json = excluded.timestamps_json,
+        burst_tokens    = excluded.burst_tokens,
+        last_refill     = excluded.last_refill
+    `).run(agentId, cat, JSON.stringify(w.timestamps), w.burstTokens, w.lastRefill);
+  }
 
   private getWindow(agentId: string, cat: Category): Window {
     if (!this.state.has(agentId)) this.state.set(agentId, new Map());
@@ -38,28 +87,29 @@ export class RateLimiter {
     w.lastRefill = Date.now();
   }
 
-  // Returns true if allowed, false if blocked.
-  // Emits velocity_spike signal when blocked.
   check(agentId: string, cat: Category): { allowed: boolean; signal: FraudSignal | null } {
     const limit = LIMITS[cat];
     const w = this.getWindow(agentId, cat);
     const now = Date.now();
 
-    // Slide window
     w.timestamps = w.timestamps.filter(t => now - t < limit.windowMs);
 
     if (w.timestamps.length < limit.count) {
       w.timestamps.push(now);
+      this.persist(agentId, cat, w);
       return { allowed: true, signal: null };
     }
 
-    // Over limit — try burst token
     this.refill(w);
     if (w.burstTokens >= 1) {
       w.burstTokens -= 1;
       w.timestamps.push(now);
+      this.persist(agentId, cat, w);
       return { allowed: true, signal: null };
     }
+
+    // Still persist the slide + refill bookkeeping so the DB reflects current state.
+    this.persist(agentId, cat, w);
 
     const signal: FraudSignal = {
       id: generateId('rate'),
@@ -75,5 +125,8 @@ export class RateLimiter {
 
   reset(agentId: string): void {
     this.state.delete(agentId);
+    if (this.db) {
+      this.db.prepare(`DELETE FROM rate_limit_window WHERE agent_id = ?`).run(agentId);
+    }
   }
 }

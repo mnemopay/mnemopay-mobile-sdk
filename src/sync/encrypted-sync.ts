@@ -155,7 +155,11 @@ export class EncryptedSync {
           }
         }
       } catch (e) {
-        console.error(`Error merging sync blob ${blob.id}:`, e);
+        if (process.env.NODE_ENV !== 'production') {
+          console.error(`Error merging sync blob ${blob.id}:`, e);
+        } else {
+          console.error('sync_merge_error');
+        }
         skipped++;
       }
     }

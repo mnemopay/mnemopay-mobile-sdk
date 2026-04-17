@@ -1,93 +1,275 @@
-# MnemoPay Mobile SDK
+# @mnemopay/mobile-sdk
 
-On-device persistent memory (encrypted SQLite + `sqlite-vec`), agent-to-agent payments, and spatial proofs. TypeScript / Node 20+.
+On-device persistent memory, agent-to-agent payments, and cryptographic spatial proofs for mobile AI apps.
 
-## Development
+## Table of Contents
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [MemoryStore](#memorystore)
+  - [WalletEngine](#walletengine)
+  - [SpatialProver](#spatialprover)
+- [API Reference](#api-reference)
+- [Platform Support](#platform-support)
 
-```bash
-npm ci
-npm run lint    # tsc --noEmit
-npm test        # unit tests (excludes tests/benchmarks/)
-npm run build   # emits dist/
-```
+## Installation
 
-## Crypto keys and migration
-
-`MnemoPay.create()` wires `NodeCrypto` with:
-
-- **`encryptionKey`** — AES-GCM; defaults to `SHA256("mnemopay:" + agentId)` when omitted.
-- **`hmacKey`** — memory integrity HMAC; defaults to `SHA256("mnemopay:mac:" + agentId)`.
-- **`signingKey`** — Ed25519 seed; defaults to `SHA256("mnemopay:sign:" + agentId)`.
-
-Older builds only fixed the encryption key and drew **random** HMAC/signing material per process. That broke cross-device sync and manifest signatures. If you open an existing database after upgrading:
-
-- **Same device, same code**: keys are now deterministic per `agentId`, so behavior is stable.
-- **Existing rows** written under random HMAC keys may **fail integrity verification** on recall unless you still have the old keys. For production, set `encryptionKey`, `hmacKey`, and `signingKey` explicitly and store them in the platform keystore.
-
-See `MnemoPayConfig` in `src/types/index.ts` for optional overrides.
-
-## Memory embeddings
-
-`MemoryStore` / `EncryptedSync` use one async embedder, configured on `MnemoPayConfig`:
-
-| Option | Behavior |
-|--------|----------|
-| *(default)* | **Hash** — `embedHash()` (SHA-256 expanded + L2 normalize). Fast, deterministic, not semantic. |
-| `embeddings: 'semantic'` | **Xenova** [`Xenova/all-MiniLM-L6-v2`](https://huggingface.co/Xenova/all-MiniLM-L6-v2) via ONNX Runtime (384-d, mean pooling, normalized). Requires optional peer **`@xenova/transformers`**. Also set `embeddingDimensions: 384` (default). |
-| `embed: (text, dim) => …` | **Custom** — sync or async; overrides `embeddings`. Vector length must match `dim` / `memory_vectors` (384). |
-
-Install semantic backend when you need it:
+Install the SDK using npm or yarn:
 
 ```bash
-npm install @xenova/transformers
+npm install @mnemopay/mobile-sdk
+# or
+yarn add @mnemopay/mobile-sdk
 ```
+
+## Quick Start
+
+### Basic Setup
+
+To get started, you need to create an instance of the `MnemoPay` SDK. This requires an `agentId` and optionally a `persistDir` for the SQLite database.
 
 ```typescript
-MnemoPay.create({
-  agentId: 'agent-1',
-  embeddings: 'semantic',
-  embeddingDimensions: 384,
+import { MnemoPay } from '@mnemopay/mobile-sdk';
+import * as path from 'path';
+
+// For Node.js, specify a persistence directory.
+// For mobile platforms, the bridge will handle persistence.
+const persistDir = path.join(process.cwd(), '.mnemopay_data');
+
+const sdk = MnemoPay.create({
+  agentId: 'your-unique-agent-id',
+  persistDir: persistDir, // Omit for mobile builds
+});
+
+// Don't forget to close the SDK when your application exits
+process.on('exit', () => sdk.close());
+process.on('SIGINT', () => {
+  sdk.close();
+  process.exit();
 });
 ```
 
-## LongMem eval (memory scale + recall)
+### MemoryStore
 
-```bash
-npm run eval:longmem              # default hash embeddings
-npm run eval:longmem:semantic     # same benchmark with Xenova MiniLM (peer dep installed)
+The `MemoryStore` allows agents to retain, recall, and manage memories.
+
+```typescript
+import { MnemoPay } from '@mnemopay/mobile-sdk';
+// ... (SDK initialization)
+
+async function useMemoryStore() {
+  // Retain a memory
+  const memory = await sdk.memory.retain(
+    'The user likes Italian food, especially pasta.',
+    {
+      source: 'conversation',
+      sessionId: 'user-session-123',
+      tags: ['preference', 'food'],
+      importance: 0.7,
+    }
+  );
+  console.log('Retained memory:', memory.id);
+
+  // Recall memories related to a query
+  const results = await sdk.memory.recall({
+    text: 'What kind of food does the user prefer?',
+    threshold: 0.5, // cosine similarity threshold
+    limit: 5,
+  });
+
+  if (results.length > 0) {
+    console.log('Recalled memories:');
+    results.forEach(r => console.log(`- Score: ${r.score.toFixed(2)}, Content: ${r.memory.content}`));
+  } else {
+    console.log('No relevant memories found.');
+  }
+
+  // Auto-retain salient facts from a conversation
+  await sdk.memory.autoRetain(
+    'User said: "I really enjoy cooking with fresh herbs." Agent said: "That's great!"',
+    'user-session-123'
+  );
+
+  // Forget a memory
+  // await sdk.memory.forget(memory.id);
+}
+
+useMemoryStore();
 ```
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `LONGMEM_N` | `200` | How many memories to retain |
-| `LONGMEM_SAMPLES` | scales with N | How many query points (spread across indices) |
-| `LONGMEM_RECALL_LIMIT` | scales with N | `recall({ limit })`; sqlite-vec uses `k ≈ limit × 3` internally |
-| `LONGMEM_EMBEDDINGS` | *(unset)* | Set to `semantic` to match `eval:longmem:semantic` |
+### WalletEngine
 
-Examples:
+The `WalletEngine` enables agent-to-agent payments, escrow contracts, and transaction history. Payments are in USD cents (BigInt).
 
-```bash
-LONGMEM_N=1000 npm run eval:longmem
-LONGMEM_N=5000 LONGMEM_SAMPLES=64 LONGMEM_RECALL_LIMIT=60 npm run eval:longmem
+```typescript
+import { MnemoPay } from '@mnemopay/mobile-sdk';
+// ... (SDK initialization)
+
+async function useWalletEngine() {
+  const myAgentId = sdk.wallet.getWallet().agentId;
+  const otherAgentId = 'another-agent-id';
+
+  // Get current wallet balance
+  const myWallet = sdk.wallet.getWallet();
+  console.log(`My balance: ${myWallet.balance} USD cents`);
+
+  // Fund wallet for testing (in a real app, this would come from a trusted source)
+  // This is a direct DB update for demonstration purposes.
+  (sdk as any).db.prepare('UPDATE wallets SET balance = ? WHERE agent_id = ?')
+    .run(1000000, myAgentId); // 10000 USD cents = $100
+
+  // Send a payment
+  const amountToSend = 500n; // 5 USD cents
+  try {
+    const tx = await sdk.wallet.send(otherAgentId, amountToSend);
+    console.log(`Payment sent! Transaction ID: ${tx.id}, Status: ${tx.status}`);
+  } catch (error: any) {
+    console.error('Payment failed:', error.message);
+  }
+
+  // Create an escrow contract
+  const escrowAmount = 1000n; // 10 USD cents
+  try {
+    const escrow = await sdk.wallet.createEscrow(
+      otherAgentId,
+      escrowAmount,
+      [{ type: 'spatial_proof', params: { h3Tile: '8928308280bffff' } }] // Condition: spatial proof at a specific H3 tile
+    );
+    console.log(`Escrow created! ID: ${escrow.id}, Status: ${escrow.status}`);
+
+    // Simulate condition met (e.g., SpatialProver verifies location)
+    sdk.wallet.markConditionMet(escrow.id, 'spatial_proof');
+
+    // Settle the escrow
+    const settleTx = await sdk.wallet.settle(escrow.id);
+    console.log(`Escrow settled! Transaction ID: ${settleTx.id}, Status: ${settleTx.status}`);
+
+  } catch (error: any) {
+    console.error('Escrow operation failed:', error.message);
+  }
+
+  // Get transaction history
+  const history = sdk.wallet.getTransactionHistory();
+  console.log('Transaction History:', history);
+}
+
+useWalletEngine();
 ```
 
-The benchmark resets the in-process memory write rate limiter every 200 retains so `LONGMEM_N=5000` can finish in one run. Production apps still enforce normal limits.
+### SpatialProver
 
-The eval prints two JSON blocks:
+The `SpatialProver` generates and verifies cryptographic proofs of an agent's location, based on GPS and sensor readings.
 
-1. **exact query** — recall text identical to the stored line. With **hash** embeds this stays near **100%** hit@3 at large N unless `k` is too small; with **semantic** embeds it should also stay very high for identical strings.
-2. **paraphrase query** — natural-language question referencing the fact index **without** copying the stored string. **Hash** embeds yield near-zero hit@5/hit@15; **semantic** embeds should improve this materially (run `npm run eval:longmem:semantic` to measure).
+```typescript
+import { MnemoPay } from '@mnemopay/mobile-sdk';
+// ... (SDK initialization)
 
-**Observed locally (hash, default `LONGMEM_RECALL_LIMIT`):** exact **hit@3 = 1.0** for `LONGMEM_N` through 5000; paraphrase **hit@5 ≈ 0** (occasional hit@15). Raise `LONGMEM_RECALL_LIMIT` if exact recall starts missing at huge N.
+async function useSpatialProver() {
+  const deviceId = 'mobile-device-xyz'; // Unique device identifier
 
-The first semantic run downloads model weights into the Hugging Face cache (can take a minute on CI — default CI keeps hash-only eval).
+  // Generate a spatial proof
+  const lat = 34.0522; // Example Latitude
+  const lng = -118.2437; // Example Longitude
+  const accuracy = 5; // GPS accuracy in meters (e.g., 5m)
+  const confidence = 0.95; // Scene recognition confidence (0-1)
+  const sensorReadings = {
+    wifi_bssid: ['AA:BB:CC:DD:EE:FF', '11:22:33:44:55:66'],
+    bluetooth_beacons: [{ id: 'beacon-1', rssi: -70 }],
+  };
 
-This repo’s Jest config uses **`jest-environment-node-single-context`** so `onnxruntime-node`’s `instanceof Float32Array` checks succeed under Jest (the default VM-isolated environment breaks typed-array identity).
+  try {
+    const proofResult = await sdk.spatial.prove(
+      lat, lng, accuracy, confidence, sensorReadings, deviceId
+    );
+    console.log('Spatial Proof Generated:', proofResult.proof.id);
+    console.log('Proof Passed:', proofResult.passed, 'Score:', proofResult.score);
 
-## CI
+    // Verify a spatial proof (e.g., from another agent or a previous proof)
+    const verificationResult = await sdk.spatial.verify(proofResult.proof.id);
+    console.log('Spatial Proof Verified:', verificationResult.passed);
+    console.log('Verification Score:', verificationResult.score);
 
-GitHub Actions runs `npm test` and `npm run eval:longmem` (with a small `LONGMEM_N`) on push and pull requests. See `.github/workflows/ci.yml`.
+  } catch (error: any) {
+    console.error('Spatial Proof failed:', error.message);
+  }
+}
 
-## License
+useSpatialProver();
+```
 
-MIT — see `package.json`.
+## API Reference
+
+The core SDK object is `MnemoPay`. It exposes the following main modules:
+
+*   **`sdk.memory: MemoryStore`**: Manages memory retention, recall, and auto-processing.
+    *   `retain(content: string, metadata: MemoryMetadata): Promise<Memory>`
+    *   `recall(query: MemoryQuery): Promise<MemoryRecallResult[]>`
+    *   `autoRetain(conversation: string, sessionId: string): Promise<Memory[]>`
+    *   `autoRecall(userMessage: string, tokenBudget?: number): Promise<string>`
+    *   `forget(memoryId: string): Promise<void>`
+    *   `count(): number`
+*   **`sdk.wallet: WalletEngine`**: Handles agent wallets, transactions, and escrow.
+    *   `getWallet(agentId?: string): AgentWallet`
+    *   `send(toAgent: string, amount: bigint, memoriesAccessed?: string[]): Promise<Transaction>`
+    *   `createEscrow(sellerAgent: string, amount: bigint, conditions: Omit<EscrowCondition, 'met'>[], timeoutMs?: number): Promise<EscrowContract>`
+    *   `settle(escrowId: string, memoriesAccessed?: string[]): Promise<Transaction>`
+    *   `markConditionMet(escrowId: string, conditionType: EscrowCondition['type']): void`
+    *   `freezeWallet(agentId: string): void`
+    *   `getTransactionHistory(limit?: number): Transaction[]`
+*   **`sdk.spatial: SpatialProver`**: Provides spatial proof generation and verification.
+    *   `prove(lat: number, lng: number, accuracy: number, confidence: number, sensorReadings: Record<string, unknown>, deviceId: string, attestationToken?: string, isRooted?: boolean): Promise<SpatialProofResult>`
+    *   `verify(proofId: string, expectedH3Tile?: string): Promise<SpatialProofResult>`
+    *   `proveAndMarkEscrow(escrowId: string, conditionType: 'spatial_proof', markConditionFn: (escrowId: string, type: 'spatial_proof') => void, lat: number, lng: number, accuracy: number, confidence: number, sensorReadings: Record<string, unknown>, deviceId: string, expectedH3Tile?: string): Promise<SpatialProofResult>`
+    *   `getProof(proofId: string): SpatialProof | null`
+    *   `getProofHistory(limit?: number): SpatialProof[]`
+*   **`sdk.sync: EncryptedSync`**: Manages encrypted, zero-knowledge cloud synchronization.
+    *   `buildPushPacket(tables?: string[]): Promise<SyncPacket>`
+    *   `applyPullPacket(packet: SyncPacket): Promise<{ merged: number; skipped: number }>`
+    *   `markSynced(recordIds: string[]): void`
+    *   `getSyncStatus(): { pendingPush: number; lastSync: number | null }`
+
+For detailed type definitions, refer to `src/types/index.ts`.
+
+## Platform Support
+
+The SDK is designed for cross-platform compatibility with specific bridges for different environments.
+
+*   **Node.js**: Full support, primarily for server-side or desktop agent applications. Uses `NodeBridge` by default.
+*   **Android/iOS**: Mobile bridges (`AndroidBridge`, `IOSBridge`) are available in `platform/index.ts`. These bridges integrate with platform-specific APIs for cryptography, storage, and attestation. To use a mobile bridge, call `MnemoPay.setPlatformBridge()` before `MnemoPay.create()`:
+
+    ```typescript
+    import { MnemoPay, AndroidBridge } from '@mnemopay/mobile-sdk';
+
+    // For Android:
+    MnemoPay.setPlatformBridge(new AndroidBridge());
+    const sdk = MnemoPay.create({ agentId: 'your-android-agent' });
+
+    // For iOS (similar approach):
+    // import { MnemoPay, IOSBridge } from '@mnemopay/mobile-sdk';
+    // MnemoPay.setPlatformBridge(new IOSBridge());
+    // const sdk = MnemoPay.create({ agentId: 'your-ios-agent' });
+    ```
+
+    Mobile environments might require specific build steps or permissions for SQLite and native cryptography modules. Please refer to the respective platform documentation for details.
+
+### RL Feedback — Reinforcement Learning for Memory
+
+After a recall + agent action, you can signal whether the recalled memories were useful. This updates each memory's `importance` score via EWMA so future recalls surface better results.
+
+```typescript
+// Recall memories for a query
+const results = await sdk.memory.recall({ text: 'user dietary preferences', limit: 5 });
+
+// ... agent acts on the recalled memories ...
+
+// Signal reward: +1 = very useful, 0 = neutral, -1 = useless
+sdk.memory.reinforceBatch(results.map(r => r.memory.id), 1.0);
+
+// Or reinforce a single memory
+sdk.memory.reinforce(results[0].memory.id, 0.8, /* alpha= */ 0.1);
+```
+
+EWMA update: `new_importance = α × ((reward+1)/2) + (1−α) × old_importance`
+
+---
+**License**: Apache-2.0
+**Author**: Jerry Omiagbo

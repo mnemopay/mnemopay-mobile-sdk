@@ -6,14 +6,9 @@
  *   LONGMEM_N=1000 npm run eval:longmem
  *   LONGMEM_N=5000 LONGMEM_SAMPLES=80 LONGMEM_RECALL_LIMIT=60 npm run eval:longmem
  *   LONGMEM_EMBEDDINGS=semantic npm run eval:longmem   # Xenova MiniLM (needs @xenova/transformers)
- *
- * Env:
- *   LONGMEM_N              — memories to store (default 200; try 1000 / 5000 for ceiling)
- *   LONGMEM_SAMPLES        — query points spread across [0, N); default scales with N
- *   LONGMEM_RECALL_LIMIT   — `recall({ limit })`; vec kNN uses k = limit * 3 in MemoryStore
- *   LONGMEM_EMBEDDINGS     — set to `semantic` for real embeddings (optional peer dep)
  */
 import { MnemoPay } from '../../src/index';
+import { classifyQuery } from '../../src/memory/queryClassifier';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
@@ -61,8 +56,6 @@ function defaultRecallLimit(n: number): number {
 
 /** Natural-language query that references fact `i` without copying the stored sentence. */
 function paraphraseQuery(i: number): string {
-  // Keep this semantically close to the stored sentence so MiniLM has enough lexical anchors.
-  // Stored: "LongMem benchmark fact i: the secret token for index i is MEM-i-TOKEN"
   return `LongMem benchmark fact ${i}: what is the secret token for index ${i}?`;
 }
 
@@ -102,12 +95,10 @@ describe('LongMem eval', () => {
     expect(row?.sql ?? '').toMatch(/agent_id\s+TEXT\s+PARTITION\s+KEY/i);
   });
 
-  it('retain N memories; measure exact vs paraphrase recall (hash embedding ceiling)', async () => {
+  it('retain N memories; measure exact vs paraphrase recall', async () => {
     const tRetain: number[] = [];
     const contents: string[] = [];
-    // MemoryStore rate-limits writes (~200 / hour window in RateLimiter). Large N exceeds that in one run;
-    // reset the in-process limiter between chunks (eval-only; production keeps limits).
-    const rateLimiter = (sdk as unknown as { rateLimiter: { reset: (id: string) => void } }).rateLimiter;
+    const rateLimiter = (sdk as any).rateLimiter;
 
     for (let i = 0; i < n; i++) {
       if (i > 0 && i % 200 === 0) rateLimiter.reset(agentId);
@@ -125,7 +116,7 @@ describe('LongMem eval', () => {
 
     const idx = sampleIndices(n, sampleCount);
 
-    // —— Exact query (same string as stored): expects ~100% until kNN / k budget breaks ——
+    // Exact query
     const tExact: number[] = [];
     let hits3 = 0;
     for (const i of idx) {
@@ -141,57 +132,152 @@ describe('LongMem eval', () => {
     }
     const exactHitRate = hits3 / idx.length;
 
-    const exactSummary = {
+    console.log('\n[LongMem eval — exact query]', JSON.stringify({
       mode: 'exact_query',
       memories: n,
       recallLimit,
-      vecKApprox: recallLimit * vecKMult,
       samples: idx.length,
-      retainMsAvg: tRetain.reduce((a, b) => a + b, 0) / tRetain.length,
-      retainMsP95: p95(tRetain),
       recallMsAvg: tExact.reduce((a, b) => a + b, 0) / tExact.length,
-      recallMsP95: p95(tExact),
       hitAt3: exactHitRate,
-    };
-    console.log('\n[LongMem eval — exact query]', JSON.stringify(exactSummary, null, 2));
+    }, null, 2));
 
-    // —— Paraphrase: production-realistic gap for hash embeddings ——
+    // Paraphrase
     const tPara: number[] = [];
     let hit5 = 0;
-    let hit15 = 0;
     for (const i of idx) {
       const needle = `MEM-${i}-TOKEN`;
       const t0 = performance.now();
       const results = await sdk.memory.recall({
         text: paraphraseQuery(i),
         limit: recallLimit,
-        // Avoid similarity-threshold filtering during eval; we want to measure retrieval quality
-        // under a fixed candidate budget (k) and post-filters only.
-        threshold: undefined,
       });
       tPara.push(performance.now() - t0);
-      if (results.slice(0, 5).some(r => r.memory.content.includes(needle))) hit5 += 1;
-      if (results.slice(0, 15).some(r => r.memory.content.includes(needle))) hit15 += 1;
+      const isHit = results.slice(0, 5).some(r => r.memory.content.includes(needle));
+      if (isHit) {
+        hit5 += 1;
+      } else {
+        console.log(`\n[LongMem MISS] index ${i}`);
+        console.log(`  Query: "${paraphraseQuery(i)}"`);
+        console.log(`  Expected needle: "${needle}"`);
+        console.log(`  Top 5 results:`);
+        results.slice(0, 5).forEach((r, j) => {
+          console.log(`    ${j+1}. Score: ${r.score.toFixed(4)}, Content: "${r.memory.content.substring(0, 80)}..."`);
+        });
+      }
     }
 
-    const paraSummary = {
+    console.log('\n[LongMem eval — paraphrase]', JSON.stringify({
       mode: 'paraphrase_query',
       memories: n,
-      recallLimit,
-      vecKApprox: recallLimit * vecKMult,
       samples: idx.length,
       recallMsAvg: tPara.reduce((a, b) => a + b, 0) / tPara.length,
-      recallMsP95: p95(tPara),
       hitAt5: hit5 / idx.length,
-      hitAt15: hit15 / idx.length,
-      note: useSemanticEmbeddings
-        ? 'Xenova all-MiniLM-L6-v2 (384-d) semantic embeddings; rates depend on vec kNN budget and paraphrase wording.'
-        : 'Hash-based embeddings are not semantic; low hit rates here are expected. ' +
-          'Use embeddings: "semantic" or a custom embed() for paraphrase recall.',
-    };
-    console.log('\n[LongMem eval — paraphrase]', JSON.stringify(paraSummary, null, 2));
+    }, null, 2));
 
-    // Same text → same hash embedding: stay high until index / k limits break.
     expect(exactHitRate).toBeGreaterThanOrEqual(0.85);
   }, 1_800_000);
+
+  describe('Decay Curve Comparison', () => {
+    it('report hitAt5 for each decay curve', async () => {
+      const curves: any[] = ['linear', 'exponential', 'logarithmic', 'none'];
+      const results: Record<string, number> = {};
+
+      for (const curve of curves) {
+        const tempSdk = MnemoPay.create({
+          agentId: `decay-${curve}`,
+          persistDir: BENCH_DIR,
+          decayCurve: curve,
+          ...(useSemanticEmbeddings ? { embeddings: 'semantic', embeddingDimensions: 384 } : {}),
+        });
+
+        const content = "Decay test fact: the magic word is ABRA-CADABRA";
+        await tempSdk.memory.retain(content, { source: 'observation', sessionId: 's', tags: [], importance: 0.5 });
+        
+        const recall = await tempSdk.memory.recall({ text: "What is the magic word?" });
+        results[curve] = recall.some(r => r.memory.content.includes("ABRA-CADABRA")) ? 1 : 0;
+        
+        tempSdk.close();
+      }
+      console.log('\n[Decay Curve Comparison]', JSON.stringify(results, null, 2));
+    });
+  });
+
+  describe('Candidate Pool Scaling', () => {
+    it('measure hitAt5 and latency at 25/50/75 candidates', async () => {
+      const pools = [25, 50, 75];
+      const summary: any[] = [];
+
+      for (const poolSize of pools) {
+        const tempSdk = MnemoPay.create({
+          agentId: `pool-${poolSize}`,
+          persistDir: BENCH_DIR,
+          candidateLimit: poolSize,
+          ...(useSemanticEmbeddings ? { embeddings: 'semantic', embeddingDimensions: 384 } : {}),
+        });
+
+        // Add some noise memories
+        for (let i = 0; i < 20; i++) {
+          await tempSdk.memory.retain(`Noise memory ${i}`, { source: 'observation', sessionId: 's', tags: [], importance: 0.1 });
+        }
+        const target = "Target fact: the key is GOLDEN-KEY";
+        await tempSdk.memory.retain(target, { source: 'observation', sessionId: 's', tags: [], importance: 0.8 });
+
+        const start = performance.now();
+        const recall = await tempSdk.memory.recall({ text: "What is the golden key?", limit: 5 });
+        const latency = performance.now() - start;
+        const hit = recall.some(r => r.memory.content.includes("GOLDEN-KEY")) ? 1 : 0;
+
+        summary.push({ poolSize, hitAt5: hit, latencyMs: latency });
+        tempSdk.close();
+      }
+      console.log('\n[Candidate Pool Scaling]', JSON.stringify(summary, null, 2));
+    });
+  });
+
+  describe('Blend Ratio Comparison', () => {
+    it('report hitAt5 for exact and paraphrase at various ratios', async () => {
+      const ratios = [0.7, 0.8, 0.9];
+      const results: any[] = [];
+
+      const tempSdk = MnemoPay.create({
+        agentId: 'blend-test',
+        persistDir: BENCH_DIR,
+        ...(useSemanticEmbeddings ? { embeddings: 'semantic', embeddingDimensions: 384 } : {}),
+      });
+
+      const fact = "The capital of France is Paris and its population is 2 million.";
+      await tempSdk.memory.retain(fact, { source: 'observation', sessionId: 's', tags: [], importance: 0.5 });
+
+      for (const ratio of ratios) {
+        const exact = await tempSdk.memory.recall({ text: fact, blendRatio: ratio });
+        const paraphrase = await tempSdk.memory.recall({ text: "Tell me about the population of the French capital", blendRatio: ratio });
+        
+        results.push({
+          ratio,
+          exactHit: exact.some(r => r.memory.content === fact) ? 1 : 0,
+          paraHit: paraphrase.some(r => r.memory.content === fact) ? 1 : 0
+        });
+      }
+      tempSdk.close();
+      console.log('\n[Blend Ratio Comparison]', JSON.stringify(results, null, 2));
+    });
+  });
+
+  describe('Query Classifier Accuracy', () => {
+    it('test classification of sample queries', () => {
+      const samples = [
+        { q: "What happened yesterday?", expected: 'temporal' },
+        { q: "Tell me about the meeting on 2024-05-12", expected: 'temporal' },
+        { q: 'Who said "the bird is the word"?', expected: 'exact' },
+        { q: "What did John Doe mention about Project X?", expected: 'exact' },
+        { q: "What do you know about life?", expected: 'semantic' },
+        { q: "How are you?", expected: 'semantic' },
+      ];
+
+      samples.forEach(s => {
+        const res = classifyQuery(s.q);
+        expect(res.type).toBe(s.expected);
+      });
+    });
+  });
 });

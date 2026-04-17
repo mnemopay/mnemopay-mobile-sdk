@@ -5,3 +5,27 @@ tests/**/*.js
 tests/**/*.js.map
 tests/**/*.d.ts
 tests/**/*.d.ts.map
+benchmark/results/
+
+# Node + build artifacts
+node_modules/
+dist/
+build/
+coverage/
+
+# SQLite scratch DBs (never commit real or test databases)
+tmp-*/
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+
+# Secrets + local env
+.env
+.env.local
+.env.*.local
+
+# Logs + OS noise
+*.log
+.DS_Store
+Thumbs.db

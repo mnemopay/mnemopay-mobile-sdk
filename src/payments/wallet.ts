@@ -110,6 +110,7 @@ export class WalletEngine {
 
     // 1. Validate
     if (amount <= 0n) throw new SecurityError('INVALID_AMOUNT', 'Amount must be positive');
+    if (amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new SecurityError('AMOUNT_OVERFLOW', 'Amount exceeds safe integer range');
     if (toAgent === this.agentId) throw new SecurityError('SELF_TRANSFER', 'Cannot send to self');
 
     const { allowed } = this.rateLimiter.check(this.agentId, 'transaction');
@@ -197,6 +198,7 @@ export class WalletEngine {
   ): Promise<EscrowContract> {
     this.guard.enforce('wallet:escrow');
     if (amount <= 0n) throw new SecurityError('INVALID_AMOUNT', 'Escrow amount must be positive');
+    if (amount > BigInt(Number.MAX_SAFE_INTEGER)) throw new SecurityError('AMOUNT_OVERFLOW', 'Amount exceeds safe integer range');
 
     this.ensureWallet(this.agentId);
     this.resetDailyIfNeeded(this.agentId);
@@ -237,44 +239,66 @@ export class WalletEngine {
 
   // ── settle — the atomic operation tying memory + payment + reputation ────────
   async settle(escrowId: string, memoriesAccessed: string[] = []): Promise<Transaction> {
-    const escrowRow = this.db.prepare(`SELECT * FROM escrows WHERE id = ?`).get(escrowId) as any;
-    if (!escrowRow) throw new SecurityError('NOT_FOUND', `Escrow ${escrowId} not found`);
-    if (escrowRow.status !== 'active') throw new SecurityError('INVALID_STATUS', `Escrow is ${escrowRow.status}`);
-    if (Date.now() > escrowRow.timeout) {
-      this.db.prepare(`UPDATE escrows SET status = 'refunded' WHERE id = ?`).run(escrowId);
-      this.db.prepare(`UPDATE wallets SET balance = balance + ? WHERE agent_id = ?`)
-        .run(escrowRow.amount, escrowRow.buyer_agent);
-      throw new SecurityError('ESCROW_EXPIRED', 'Escrow has timed out and been refunded');
-    }
+    this.guard.enforce('wallet:escrow');
 
-    const conditions: EscrowCondition[] = JSON.parse(escrowRow.conditions);
-    const unmet = conditions.filter(c => !c.met);
-    if (unmet.length > 0) throw new SecurityError('CONDITIONS_NOT_MET', `Unmet conditions: ${unmet.map(c => c.type).join(', ')}`);
+    // Pre-read for authorization + values to sign. Re-validated inside the write lock below.
+    const preRow = this.db.prepare(`SELECT * FROM escrows WHERE id = ?`).get(escrowId) as any;
+    if (!preRow) throw new SecurityError('NOT_FOUND', `Escrow ${escrowId} not found`);
+    if (preRow.buyer_agent !== this.agentId && preRow.seller_agent !== this.agentId) {
+      throw new SecurityError('UNAUTHORIZED', 'Only escrow parties can settle');
+    }
 
     const txId = generateId('tx');
     const now = Date.now();
-    const amount = BigInt(escrowRow.amount);
+    const amount = BigInt(preRow.amount);
 
-    const txData = Buffer.from(JSON.stringify({ txId, escrowId, from: escrowRow.buyer_agent, to: escrowRow.seller_agent, amount: amount.toString(), now }));
+    const txData = Buffer.from(JSON.stringify({
+      txId, escrowId,
+      from: preRow.buyer_agent, to: preRow.seller_agent,
+      amount: amount.toString(), now,
+    }));
     const signature = await this.crypto.sign(txData);
 
-    // Atomic: credit seller + boost reputation + close escrow
-    const tx = this.db.transaction(() => {
+    // All state reads + mutations inside BEGIN IMMEDIATE — prevents TOCTOU between
+    // status/timeout check and balance update. Pattern matches send() above.
+    this.db.prepare('BEGIN IMMEDIATE').run();
+    try {
+      const row = this.db.prepare(`SELECT * FROM escrows WHERE id = ?`).get(escrowId) as any;
+      if (!row) throw new SecurityError('NOT_FOUND', `Escrow ${escrowId} not found`);
+      if (row.status !== 'active') throw new SecurityError('INVALID_STATUS', `Escrow is ${row.status}`);
+
+      if (Date.now() > row.timeout) {
+        this.db.prepare(`UPDATE escrows SET status = 'refunded' WHERE id = ?`).run(escrowId);
+        this.db.prepare(`UPDATE wallets SET balance = balance + ? WHERE agent_id = ?`)
+          .run(row.amount, row.buyer_agent);
+        this.db.prepare('COMMIT').run();
+        throw new SecurityError('ESCROW_EXPIRED', 'Escrow has timed out and been refunded');
+      }
+
+      const conditions: EscrowCondition[] = JSON.parse(row.conditions);
+      const unmet = conditions.filter(c => !c.met);
+      if (unmet.length > 0) {
+        throw new SecurityError('CONDITIONS_NOT_MET', `Unmet conditions: ${unmet.map(c => c.type).join(', ')}`);
+      }
+
       this.db.prepare(`UPDATE wallets SET balance = balance + ?, reputation = MIN(100, reputation + 1) WHERE agent_id = ?`)
-        .run(Number(amount), escrowRow.seller_agent);
+        .run(Number(amount), row.seller_agent);
       this.db.prepare(`UPDATE escrows SET status = 'released' WHERE id = ?`).run(escrowId);
       this.db.prepare(`
         INSERT INTO transactions (id, from_agent, to_agent, amount, currency, type, status, escrow_id, memories_accessed, signature, nonce, created_at)
         VALUES (?, ?, ?, ?, 'USD_CENTS', 'escrow_release', 'settled', ?, ?, ?, 0, ?)
-      `).run(txId, escrowRow.buyer_agent, escrowRow.seller_agent, Number(amount), escrowId, JSON.stringify(memoriesAccessed), signature, now);
-    });
-    
-    tx();
+      `).run(txId, row.buyer_agent, row.seller_agent, Number(amount), escrowId, JSON.stringify(memoriesAccessed), signature, now);
 
-    this.fraud.recordAction(escrowRow.seller_agent, `settle:${escrowId}`);
+      this.db.prepare('COMMIT').run();
+    } catch (e) {
+      if (this.db.inTransaction) this.db.prepare('ROLLBACK').run();
+      throw e;
+    }
+
+    this.fraud.recordAction(preRow.seller_agent, `settle:${escrowId}`);
 
     return {
-      id: txId, fromAgent: escrowRow.buyer_agent, toAgent: escrowRow.seller_agent,
+      id: txId, fromAgent: preRow.buyer_agent, toAgent: preRow.seller_agent,
       amount, currency: 'USD_CENTS', type: 'escrow_release', status: 'settled',
       escrowId, memoriesAccessed,
       signature: Buffer.from(signature).toString('hex'),

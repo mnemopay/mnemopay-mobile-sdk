@@ -58,6 +58,26 @@ function tensorDataToFloat32(raw: unknown): Float32Array {
   throw new Error('Unexpected embedding tensor shape from feature extractor');
 }
 
+/** 
+ * Projects a high-dim vector into low-dim space via matrix multiplication.
+ * matrix is expected to be [targetDim][sourceDim]
+ */
+export function applyPCA(vec: Float32Array, matrix: Float32Array[]): Float32Array {
+  const targetDim = matrix.length;
+  const sourceDim = matrix[0].length;
+  const out = new Float32Array(targetDim);
+
+  for (let i = 0; i < targetDim; i++) {
+    let dot = 0;
+    const row = matrix[i];
+    for (let j = 0; j < sourceDim; j++) {
+      dot += vec[j] * row[j];
+    }
+    out[i] = dot;
+  }
+  return l2Normalize(out);
+}
+
 let semanticPipelinePromise: Promise<unknown> | null = null;
 
 async function loadSemanticPipeline(): Promise<(text: string, opts: object) => Promise<unknown>> {
@@ -83,30 +103,42 @@ async function loadSemanticPipeline(): Promise<(text: string, opts: object) => P
  * - `embeddings: 'semantic'` uses Xenova all-MiniLM-L6-v2 (384-dim, L2-normalized).
  * - Default: hash backend.
  */
-export function createAsyncEmbedder(config: MnemoPayConfig): (text: string) => Promise<Float32Array> {
+export function createAsyncEmbedder(
+  config: MnemoPayConfig, 
+  pcaMatrix?: Float32Array[]
+): (text: string) => Promise<Float32Array> {
   const dim = config.embeddingDimensions ?? SEMANTIC_EMBEDDING_DIM;
+
+  let baseEmbedder: (text: string) => Promise<Float32Array>;
 
   if (config.embed) {
     const fn = config.embed;
-    return async (text: string) => {
+    baseEmbedder = async (text: string) => {
       const v = await Promise.resolve(fn(text, dim));
       return toFloat32Length(v, dim);
     };
-  }
-
-  if (config.embeddings === 'semantic') {
+  } else if (config.embeddings === 'semantic') {
     if (dim !== SEMANTIC_EMBEDDING_DIM) {
       throw new Error(
         `embeddings: "semantic" requires embeddingDimensions: ${SEMANTIC_EMBEDDING_DIM} (all-MiniLM-L6-v2).`,
       );
     }
-    return async (text: string) => {
+    baseEmbedder = async (text: string) => {
       const pipe = await loadSemanticPipeline();
       const raw = await pipe(text, { pooling: 'mean', normalize: true });
       const data = tensorDataToFloat32(raw);
       return toFloat32Length(data, SEMANTIC_EMBEDDING_DIM);
     };
+  } else {
+    baseEmbedder = async (text: string) => embedHash(text, dim);
   }
 
-  return async (text: string) => embedHash(text, dim);
+  if (pcaMatrix) {
+    return async (text: string) => {
+      const vec = await baseEmbedder(text);
+      return applyPCA(vec, pcaMatrix);
+    };
+  }
+
+  return baseEmbedder;
 }
