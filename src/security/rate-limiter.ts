@@ -31,10 +31,22 @@ const SCHEMA = `
   );
 `;
 
+/**
+ * FOR TEST / BENCHMARK USE ONLY — pass `{ disabled: true }` to skip all
+ * rate-limit checks. This option MUST NOT be set in production code.
+ * Production LIMITS constants are unchanged; the bypass is opt-in at
+ * construction time only and has no env-var equivalent.
+ */
+export interface RateLimiterOptions {
+  disabled?: boolean;
+}
+
 export class RateLimiter {
   private state = new Map<string, Map<Category, Window>>();
+  private readonly disabled: boolean;
 
-  constructor(private readonly db?: Database.Database) {
+  constructor(private readonly db?: Database.Database, opts: RateLimiterOptions = {}) {
+    this.disabled = opts.disabled === true;
     if (db) this.hydrate(db);
   }
 
@@ -88,6 +100,8 @@ export class RateLimiter {
   }
 
   check(agentId: string, cat: Category): { allowed: boolean; signal: FraudSignal | null } {
+    if (this.disabled) return { allowed: true, signal: null };
+
     const limit = LIMITS[cat];
     const w = this.getWindow(agentId, cat);
     const now = Date.now();

@@ -234,4 +234,11 @@ export interface MnemoPayConfig {
    * read-only filesystems without throwing.
    */
   allowInsecureDefault?: boolean;
+  /**
+   * FOR BENCHMARK / TEST USE ONLY. Bypasses all RateLimiter checks so that
+   * high-volume fuzz runs are not cut short by per-hour write limits.
+   * A console.warn is emitted at construction time when this flag is set.
+   * NEVER enable in production or shipped builds.
+   */
+  disableRateLimitsForBenchmark?: boolean;
 }

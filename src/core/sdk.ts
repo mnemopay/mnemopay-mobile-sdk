@@ -65,7 +65,10 @@ export class MnemoPay {
     FraudDetector.initSchema(this.db);
     RateLimiter.initSchema(this.db);
 
-    this.rateLimiter = new RateLimiter(this.db);
+    if (config.disableRateLimitsForBenchmark) {
+      console.warn('MnemoPay: disableRateLimitsForBenchmark is set — rate limits are OFF. FOR BENCHMARK/TEST USE ONLY.');
+    }
+    this.rateLimiter = new RateLimiter(this.db, { disabled: config.disableRateLimitsForBenchmark === true });
     this.fraud = new FraudDetector(this.db);
 
     this.memory = new MemoryStore(
